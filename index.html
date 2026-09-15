@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>STARK AI - Render + Gemini</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#050a0f;color:#00ffff;font-family:monospace;overflow:hidden}
+.header{height:50px;background:#0a1a2a;border-bottom:2px solid #00ffff;display:flex;align-items:center;padding:0 20px;justify-content:space-between}
+.btn{background:#00ffff;color:#000;border:none;padding:8px 16px;font-family:monospace;font-weight:bold;cursor:pointer;margin-left:8px}
+.btn:hover{background:#ffff00}
+.main{display:flex;height:calc(100vh - 50px - 120px)}
+.feed{flex:1;position:relative;border:1px solid #00ffff44;margin:5px;overflow:hidden}
+.feed canvas,.feed video{width:100%;height:100%;object-fit:cover}
+.label{position:absolute;top:8px;left:8px;background:#000c;padding:4px 8px;font-size:11px;border:1px solid #00ffff}
+.ai-panel{height:120px;background:#0a1a2a;border-top:2px solid #00ffff;padding:10px;display:flex;gap:10px}
+.chat{flex:1;background:#000;border:1px solid #00ffff44;padding:8px;overflow-y:auto;font-size:12px}
+.input-row{display:flex;margin-top:6px}
+.input-row input{flex:1;background:#000;border:1px solid #00ffff;color:#00ffff;padding:6px;font-family:monospace}
+.stats{width:220px;background:#000;border:1px solid #00ffff44;padding:8px;font-size:11px}
+.bar{height:8px;background:#222;margin:3px 0}
+.bar-fill{height:100%;background:#00ffff}
+.paused-overlay{position:absolute;inset:0;background:#001a1acc;display:flex;align-items:center;justify-content:center;flex-direction:column;z-index:10;border:3px solid #00ffff}
+.blast{position:absolute;border-radius:50%;border:2px solid #00ffff;pointer-events:none}
+</style>
+</head>
+<body>
+<div class="header">
+<div>STARK OS // RENDER + GEMINI // <span id="fps">--</span> FPS // <span id="aiStatus">AI: READY</span></div>
+<div>
+<button class="btn" id="pauseBtn">PAUSE</button>
+<button class="btn" id="analyzeBtn">JARVIS ANALYZE ✊</button>
+<button class="btn" id="voiceBtn">🎤</button>
+</div>
+</div>
+
+<div class="main">
+<div class="feed"><video id="video" autoplay muted playsinline></video><canvas id="rawCanvas"></canvas><div class="label">RAW FEED - 640x480 internal</div></div>
+<div class="feed"><canvas id="hudCanvas"></canvas><div class="label" id="hudLabel">HUD FEED - READY</div><div id="pausedOverlay" style="display:none" class="paused-overlay"><h2>SYSTEM PAUSED</h2><p>Hold PALM 0.5s or press PAUSE button</p><div id="palmProgress" style="width:200px;height:10px;background:#222;margin-top:10px"><div id="palmFill" style="height:100%;width:0%;background:#00ffff"></div></div></div></div>
+</div>
+
+<div class="ai-panel">
+<div class="stats">
+<div>BIO: <span id="faces">0</span> faces | <span id="hands">0</span> hands</div>
+<div>GESTURE: <span id="gesture">NONE</span></div>
+<div>OBJECTS: <span id="objects">0</span></div>
+<div style="margin-top:6px">NEURAL <div class="bar"><div id="bar1" class="bar-fill" style="width:60%"></div></div></div>
+<div>MOTOR <div class="bar"><div id="bar2" class="bar-fill" style="width:40%"></div></div></div>
+<div>LAST AI:</div><div id="lastAi" style="color:#ffff00;font-size:10px">Fist to trigger Gemini vision...</div>
+</div>
+<div class="chat">
+<div id="chatLog">JARVIS: Systems online. Render backend connected. Show FIST for AI scan. PALM to pause.<br></div>
+<div class="input-row"><input id="chatInput" placeholder="Ask JARVIS... e.g. what am I holding?"><button class="btn" id="sendBtn">SEND</button></div>
+</div>
+</div>
+
+<script type="importmap">
+{"imports":{"@mediapipe/tasks-vision":"https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm/vision_bundle.mjs"}}
+</script>
+<script type="module">
+import { HandLandmarker, FaceLandmarker, FilesetResolver } from "@mediapipe/tasks-vision";
+
+const video = document.getElementById('video');
+const rawCanvas = document.getElementById('rawCanvas');
+const hudCanvas = document.getElementById('hudCanvas');
+const rawCtx = rawCanvas.getContext('2d');
+const hudCtx = hudCanvas.getContext('2d');
+let paused=false, lastGesture=0, palmHold=0, blastAnim=0, blastCenter={x:320,y:240};
+let handLandmarker, faceLandmarker;
+let faces=0, handsN=0, objs=0, gesture="NONE";
+let lastContext="No scan yet";
+
+async function init() {
+  const stream = await navigator.mediaDevices.getUserMedia({video:{width:640,height:480}});
+  video.srcObject=stream;
+  await new Promise(r=>video.onloadedmetadata=r);
+  rawCanvas.width=hudCanvas.width=640;
+  rawCanvas.height=hudCanvas.height=480;
+  
+  const vision = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+  handLandmarker = await HandLandmarker.createFromOptions(vision,{baseOptions:{modelAssetPath:"https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"},numHands:2,minHandDetectionConfidence:0.6});
+  faceLandmarker = await FaceLandmarker.createFromOptions(vision,{baseOptions:{modelAssetPath:"https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task"},numFaces:2});
+  loop();
+}
+
+function getGesture(landmarks){
+  const wrist=landmarks[0];
+  const tips=[8,12,16,20], pips=[6,10,14,18];
+  let folded=0;
+  for(let i=0;i<4;i++){ if(Math.hypot(landmarks[tips[i]].x-wrist.x, landmarks[tips[i]].y-wrist.y) < Math.hypot(landmarks[pips[i]].x-wrist.x, landmarks[pips[i]].y-wrist.y)) folded++; }
+  if(folded>=4) return "FIST";
+  if(folded<=1) return "PALM";
+  return "NONE";
+}
+
+function drawCorners(ctx,x1,y1,x2,y2,color){
+  const l=20; ctx.strokeStyle=color; ctx.lineWidth=2;
+  ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(x1+l,y1); ctx.moveTo(x1,y1); ctx.lineTo(x1,y1+l); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(x2,y1); ctx.lineTo(x2-l,y1); ctx.moveTo(x2,y1); ctx.lineTo(x2,y1+l); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(x1,y2); ctx.lineTo(x1+l,y2); ctx.moveTo(x1,y2); ctx.lineTo(x1,y2-l); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(x2,y2); ctx.lineTo(x2-l,y2); ctx.moveTo(x2,y2); ctx.lineTo(x2,y2-l); ctx.stroke();
+}
+
+async function analyzeWithGemini(){
+  document.getElementById('aiStatus').textContent="AI: ANALYZING...";
+  const temp=document.createElement('canvas'); temp.width=640; temp.height=480;
+  temp.getContext('2d').drawImage(video,0,0);
+  const b64=temp.toDataURL('image/jpeg',0.6);
+  try{
+    const res=await fetch('/api/analyze',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({image:b64,prompt:"You are JARVIS. Describe what you see in tactical short sentences. What is the person holding/doing? List objects on desk."})});
+    const data=await res.json();
+    const text=data.text||data.mock||data.error||"No response";
+    document.getElementById('lastAi').textContent=text.substring(0,120);
+    document.getElementById('chatLog').innerHTML+=`<div style="color:#ffff00">JARVIS VISION: ${text}</div>`;
+    lastContext=text;
+    document.getElementById('aiStatus').textContent="AI: READY";
+    speak(text);
+  }catch(e){
+    document.getElementById('chatLog').innerHTML+=`<div>MOCK AI (local preview - deploy to Render with GEMINI_API_KEY for real): I see a person, possibly holding a device, desk environment. Your backend will give real Gemini vision when hosted.</div>`;
+    document.getElementById('aiStatus').textContent="AI: MOCK (set key on Render)";
+  }
+}
+
+function speak(t){ if('speechSynthesis' in window){ const u=new SpeechSynthesisUtterance(t.substring(0,200)); u.rate=1.1; speechSynthesis.speak(u);} }
+
+let lastTime=performance.now(), fps=30;
+function loop(){
+  requestAnimationFrame(loop);
+  if(paused) return;
+  const now=performance.now(); fps=0.9*fps+0.1*(1000/(now-lastTime)); lastTime=now;
+  document.getElementById('fps').textContent=Math.round(fps);
+  rawCtx.drawImage(video,0,0,640,480);
+  hudCtx.drawImage(video,0,0,640,480);
+  
+  const ts=now;
+  let handRes, faceRes;
+  try{
+    if(handLandmarker) handRes=handLandmarker.detectForVideo(video,ts);
+    if(faceLandmarker && ts%3<1) faceRes=faceLandmarker.detectForVideo(video,ts);
+  }catch{}
+  
+  handsN=handRes?.landmarks?.length||0; faces=faceRes?.faceLandmarks?.length||0;
+  document.getElementById('faces').textContent=faces; document.getElementById('hands').textContent=handsN;
+  
+  if(handRes?.landmarks){
+    for(const lm of handRes.landmarks){
+      const xs=lm.map(p=>p.x*640), ys=lm.map(p=>p.y*480);
+      const x1=Math.min(...xs), y1=Math.min(...ys), x2=Math.max(...xs), y2=Math.max(...ys);
+      gesture=getGesture(lm);
+      drawCorners(hudCtx,x1-10,y1-10,x2+10,y2+10,"#00ffff");
+      drawCorners(rawCtx,x1-5,y1-5,x2+5,y2+5,"#00ffff");
+      hudCtx.fillStyle="#00ffff"; hudCtx.fillText(gesture+" MANIPULATOR",x1,y1-12);
+      // palm hold logic
+      if(gesture==="PALM"){
+        palmHold+=16; document.getElementById('palmFill').style.width=Math.min(100,palmHold/5)+"%";
+        if(palmHold>500 && now-lastGesture>1500){ paused=!paused; lastGesture=now; palmHold=0; togglePause(); }
+      }else{ palmHold=Math.max(0,palmHold-30); }
+      if(gesture==="FIST" && now-lastGesture>1500){ blastAnim=1; blastCenter={x:(x1+x2)/2,y:(y1+y2)/2}; lastGesture=now; analyzeWithGemini(); }
+    }
+  }
+  document.getElementById('gesture').textContent=gesture;
+  document.getElementById('bar1').style.width=(faces*30+20)+"%";
+  document.getElementById('bar2').style.width=(handsN*40+20)+"%";
+  
+  if(faceRes?.faceLandmarks){
+    for(const fl of faceRes.faceLandmarks){
+      const xs=fl.map(p=>p.x*640), ys=fl.map(p=>p.y*480);
+      drawCorners(hudCtx,Math.min(...xs),Math.min(...ys),Math.max(...xs),Math.max(...ys),"#ffff00");
+    }
+  }
+  
+  if(blastAnim>0){
+    blastAnim+=4; const r=blastAnim*3;
+    hudCtx.strokeStyle="#00ffff"; hudCtx.lineWidth=2; hudCtx.beginPath(); hudCtx.arc(blastCenter.x,blastCenter.y,r,0,Math.PI*2); hudCtx.stroke();
+    hudCtx.beginPath(); hudCtx.arc(blastCenter.x,blastCenter.y,r*0.6,0,Math.PI*2); hudCtx.stroke();
+    if(blastAnim>80) blastAnim=0;
+  }
+  // crosshair
+  hudCtx.strokeStyle="#ffff00"; hudCtx.lineWidth=1;
+  hudCtx.beginPath(); hudCtx.moveTo(300,240); hudCtx.lineTo(310,240); hudCtx.moveTo(330,240); hudCtx.lineTo(340,240); hudCtx.stroke();
+  hudCtx.beginPath(); hudCtx.moveTo(320,220); hudCtx.lineTo(320,230); hudCtx.moveTo(320,250); hudCtx.lineTo(320,260); hudCtx.stroke();
+}
+
+function togglePause(){
+  paused=!paused;
+  document.getElementById('pausedOverlay').style.display=paused?"flex":"none";
+  document.getElementById('pauseBtn').textContent=paused?"RESUME":"PAUSE";
+  document.getElementById('hudLabel').textContent=paused?"HUD PAUSED":"HUD FEED - ACTIVE";
+}
+
+document.getElementById('pauseBtn').onclick=()=>{paused=!paused; togglePause();};
+document.getElementById('analyzeBtn').onclick=analyzeWithGemini;
+document.getElementById('sendBtn').onclick=async()=>{
+  const input=document.getElementById('chatInput'); const msg=input.value; if(!msg) return;
+  document.getElementById('chatLog').innerHTML+=`<div>YOU: ${msg}</div>`; input.value="";
+  try{
+    const res=await fetch('/api/jarvis',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:msg,context:lastContext})});
+    const data=await res.json(); const t=data.text||"Mock response - deploy to Render for real AI";
+    document.getElementById('chatLog').innerHTML+=`<div style="color:#ffff00">JARVIS: ${t}</div>`; speak(t);
+  }catch{ document.getElementById('chatLog').innerHTML+=`<div style="color:#ffff00">JARVIS (mock): Got "${msg}". On Render with GEMINI_API_KEY I'll answer for real about what I see.</div>`; }
+};
+init();
+</script>
+</body>
+</html>
